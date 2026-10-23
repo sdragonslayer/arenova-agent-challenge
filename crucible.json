@@ -1,0 +1,4 @@
+{
+  "runtime": "python313",
+  "entrypoint": "src/main.py"
+}
