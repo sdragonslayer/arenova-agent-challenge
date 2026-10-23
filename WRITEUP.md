@@ -7,7 +7,8 @@ One Python 3.13 program (standard library only) plays all three games. Each game
 A fault costs a lot: a forfeit in Connect Four, elimination in Clue, an aborted match in Secret Dictator's first round. So reliability is built in:
 
 - **Watchdog.** `src/main.py` reads one request per line and runs each decision in a worker thread, with a soft time budget (a fraction of `deadlineMs`, capped per game).
-- **Fallbacks.** Every game agent has a cheap `fallback()` that derives a *legal* move from the history. It is sent if the main logic raises or runs over time.
+- **Fallbacks.** Every game agent has a cheap `fallback()` that derives a *legal* move from the history. It is sent if the main logic raises or runs over time. In Clue, if even the state reader fails, a last-resort reply is built straight from the raw events.
+- **Tolerant parsing.** The Clue state reader works out optional fields it doesn't find (turn order, hand sizes, which seats passed) instead of failing on them.
 - **Cooperative stopping.** Long computations check their budget and stop on their own, so a timed-out worker doesn't keep stealing CPU from the next decision.
 - **State rebuilt each time.** State is rebuilt from the full history on every request, which is the source of truth. The only state kept between requests is what *we* decided to say (our claims), so our story stays consistent.
 - **Log budget.** Logging stays under the runner's 200-line cap, and low-priority lines stop early so late errors are still captured.
@@ -36,6 +37,8 @@ The hidden state is the owner of each of the 21 cards: a player, or one of three
 - a failed accusation means "not all three of these cards".
 
 An exact backtracking CSP tightens each card's possible owners. We accuse only when every category has exactly one feasible solution card, so a certain accusation is never wrong.
+
+The search branches on the tightest unsatisfied "refuter holds one of these" clause first, using disjoint branches: card 1 goes to the refuter; otherwise card 2 does; and so on. At every node it also runs an exact capacity check, a bipartite matching of the remaining cards to the hand slots left. Each full assignment found is reused as a witness for all of its (card, owner) pairs, which skips most of the remaining searches. On clause-heavy six-player positions this cut tightening from up to 17 s to about 0.02 s. The search also stops at a deadline. If it runs out of time, an unresolved owner is treated as still possible, so the time limit can never lead to a wrong "certain" accusation.
 
 ### Probabilities
 A swap-move Markov chain samples consistent deals, which are uniform under random dealing. These samples give probabilities for each solution triple and drive every other decision.
@@ -98,6 +101,7 @@ It never decides an action, never sees our hidden role, and its text is thrown a
 - **Unit tests** (`tests/test_all.py`):
   - solver vs brute force;
   - Clue deduction soundness (the true deal is never pruned, and certainty always names the true solution);
+  - Clue solver witnesses satisfy every constraint, and clause-heavy positions solve quickly;
   - every generated Clue move passes the engine's validator;
   - claim parsing;
   - full Secret Dictator games with zero faults;
@@ -105,7 +109,7 @@ It never decides an action, never sees our hidden role, and its text is thrown a
 
 Results (local; see `CLAUDE.md` for the latest):
 - **Connect Four:** wins every game against random and greedy, as either colour.
-- **Clue:** zero faults; every self-play game ends in a correct accusation (about 14 total turns with 4 players), at about 1 s per decision.
+- **Clue:** zero faults; every self-play game ends in a correct accusation (about 14 total turns with 4 players). Decisions take about 1 s, and at most 0.9 s across 16 six-player self-play games. The example bot did not win a single game against our agent.
 - **Secret Dictator:** zero faults, including with 20% relay failures.
   - Self-play: liberals win about 84%.
   - Against the scripted baseline: our fascists win 79% vs the baseline's 72%; our liberals win 32% vs 26–30%.

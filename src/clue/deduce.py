@@ -13,6 +13,7 @@ consistent deals with a swap-move Markov chain, which is what the probabilities
 and the information-gain estimates are built on.
 """
 import random
+import time
 
 CATS = ("suspect", "weapon", "room")
 
@@ -41,6 +42,7 @@ class Knowledge:
         self.clauses = []        # (owner, cardmask)
         self.not_solution = []   # cardmask of 3 cards
         self.version = 0
+        self.deadline = None     # time.monotonic() after which searches give up (treated as "unknown")
 
     # -- facts -------------------------------------------------------------
     def card_mask(self, cards):
@@ -95,20 +97,45 @@ class Knowledge:
         notsol = self.not_solution
         sol_mask_owners = [self.n, self.n + 1, self.n + 2]
         counter = [0]
+        deadline = self.deadline
+
+        n_owners = self.n_owners
+
+        def matchable(unassigned, open_mask):
+            # Exact capacity check: can every unassigned card get an owner with room left?
+            holders = [[] for _ in range(n_owners)]
+
+            def augment(i, seen):
+                for o in bits(dom[i] & open_mask & ~seen[0]):
+                    seen[0] |= 1 << o
+                    if len(holders[o]) < rem[o]:
+                        holders[o].append(i)
+                        return True
+                    for k, j in enumerate(holders[o]):
+                        if augment(j, seen):
+                            holders[o][k] = i
+                            return True
+                return False
+
+            for i in unassigned:
+                if not augment(i, [0]):
+                    return False
+            return True
 
         def ok_state(unassigned):
-            # Each owner must still be able to fill its remaining capacity exactly.
-            avail = [0] * self.n_owners
-            for i in unassigned:
-                for o in bits(dom[i]):
-                    avail[o] += 1
+            open_mask = 0
             total = 0
-            for o in range(self.n_owners):
-                if rem[o] < 0 or avail[o] < rem[o]:
+            for o in range(n_owners):
+                if rem[o] < 0:
                     return False
-                total += rem[o]
+                if rem[o]:
+                    open_mask |= 1 << o
+                    total += rem[o]
             if total != len(unassigned):
                 return False
+            for i in unassigned:
+                if not dom[i] & open_mask:
+                    return False
             # Every unsatisfied clause needs a card that can still go to its owner.
             for o, m in clauses:
                 if own[o] & m:
@@ -127,31 +154,64 @@ class Knowledge:
                 for m in notsol:
                     if solcards & m == m:
                         return False
-            return True
+            return matchable(unassigned, open_mask)
+
+        def assign(i, o, unassigned):
+            owner_of[i] = o
+            own[o] |= 1 << i
+            rem[o] -= 1
+            rest = [j for j in unassigned if j != i]
+            if ok_state(rest) and rec(rest):
+                return True
+            owner_of[i] = -1
+            own[o] &= ~(1 << i)
+            rem[o] += 1
+            return False
 
         def rec(unassigned):
             counter[0] += 1
             if counter[0] > limit:
                 raise _Limit()
+            if deadline is not None and not counter[0] & 255 and time.monotonic() > deadline:
+                raise _Limit()
             if not unassigned:
                 return True
-            # Most constrained card first.
-            best = min(unassigned, key=lambda i: popcount(dom[i]))
-            rest = [i for i in unassigned if i != best]
-            owners = list(bits(dom[best]))
+            # Branch on the tightest unsatisfied clause first: card 1 -> o, else card 2 -> o, ...
+            tight = None
+            for o, m in clauses:
+                if own[o] & m:
+                    continue
+                cands = [i for i in bits(m) if owner_of[i] == -1 and (dom[i] >> o) & 1]
+                if tight is None or len(cands) < len(tight[1]):
+                    tight = (o, cands)
+                    if len(cands) <= 1:
+                        break
+            if tight is not None:
+                o, cands = tight
+                saved = [dom[i] for i in cands]
+                found = False
+                for i in cands:
+                    if assign(i, o, unassigned):
+                        found = True
+                        break
+                    dom[i] &= ~(1 << o)
+                    if not ok_state(unassigned):
+                        break
+                for i, d in zip(cands, saved):
+                    dom[i] = d
+                return found
+            # Otherwise the most constrained card.
+            open_mask = 0
+            for o in range(n_owners):
+                if rem[o] > 0:
+                    open_mask |= 1 << o
+            best = min(unassigned, key=lambda i: popcount(dom[i] & open_mask))
+            owners = list(bits(dom[best] & open_mask))
             if rng is not None:
                 rng.shuffle(owners)
             for o in owners:
-                if rem[o] <= 0:
-                    continue
-                owner_of[best] = o
-                own[o] |= 1 << best
-                rem[o] -= 1
-                if ok_state(rest) and rec(rest):
+                if assign(best, o, unassigned):
                     return True
-                owner_of[best] = -1
-                own[o] &= ~(1 << best)
-                rem[o] += 1
             return False
 
         unassigned = list(range(n_cards))
@@ -166,15 +226,23 @@ class Knowledge:
 
     def possible_matrix(self):
         """possible[i] = bitmask of owners card i can really have (exact)."""
-        out = []
+        # Every full assignment found is a witness for all of its (card, owner) pairs.
+        out = [0] * len(self.cards)
+        rng = random.Random(len(self.cards) * 7919 + self.version)
         for i in range(len(self.cards)):
-            m = 0
-            for o in bits(self.domain[i]):
-                r = self.feasible(extra={i: o})
+            for o in bits(self.domain[i] & ~out[i]):
+                if (out[i] >> o) & 1:
+                    continue
+                if self.deadline is not None and time.monotonic() > self.deadline:
+                    out[i] |= 1 << o  # out of time: keep it as possible
+                    continue
+                r = self.feasible(extra={i: o}, rng=rng)
                 if r is None:
                     continue
-                m |= 1 << o  # r is a solution, or the limit hit (assume possible)
-            out.append(m)
+                out[i] |= 1 << o  # r is a solution, or the limit hit (assume possible)
+                if r:
+                    for j, oj in enumerate(r):
+                        out[j] |= 1 << oj
         return out
 
     def tighten(self):

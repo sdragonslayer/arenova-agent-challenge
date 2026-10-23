@@ -114,6 +114,45 @@ class ClueDeductionTests(unittest.TestCase):
             for b in game.bots.values():
                 b.close()
 
+    def test_witnesses_valid_and_fast(self):
+        """feasible() witnesses satisfy every constraint; clause-heavy positions tighten quickly."""
+        import time
+        from clue.deduce import Knowledge
+        cats = ("suspect", "weapon", "room")
+        cards = [cats[k] + ":%d" % j for k, size in enumerate((6, 6, 9)) for j in range(size)]
+        cat = {c: c.split(":")[0] for c in cards}
+        rng = random.Random(11)
+        for trial in range(40):
+            n = rng.choice([3, 4, 5, 6])
+            sol = [rng.choice([c for c in cards if cat[c] == k]) for k in cats]
+            deck = [c for c in cards if c not in sol]
+            rng.shuffle(deck)
+            hands = [deck[i::n] for i in range(n)]
+            kn = Knowledge(cards, cat, n, [len(h) for h in hands])
+            for c in cards:
+                (kn.set_owner if c in hands[0] else kn.exclude)(c, 0)
+            for _ in range(25):
+                tri = [rng.choice([c for c in cards if cat[c] == k]) for k in cats]
+                ref = next((p for p in range(2, n) if any(c in hands[p] for c in tri)), None)
+                if ref is not None:
+                    kn.add_clause(ref, tri)
+            t0 = time.monotonic()
+            mat = kn.tighten()
+            self.assertLess(time.monotonic() - t0, 3.0)
+            for i, c in enumerate(cards):
+                true_owner = next((p for p in range(n) if c in hands[p]), None)
+                if true_owner is None:
+                    true_owner = n + cats.index(cat[c])
+                self.assertTrue((mat[i] >> true_owner) & 1)
+            w = kn.feasible(rng=rng)
+            self.assertTrue(w)
+            for o in range(kn.n_owners):
+                self.assertEqual(sum(1 for x in w if x == o), kn.capacity[o])
+            for i, o in enumerate(w):
+                self.assertTrue((kn.domain[i] >> o) & 1)
+            for o, m in kn.clauses:
+                self.assertTrue(any(w[i] == o for i in range(len(cards)) if (m >> i) & 1))
+
 
 class ClueMovementTests(unittest.TestCase):
     def test_generated_moves_pass_engine_validation(self):

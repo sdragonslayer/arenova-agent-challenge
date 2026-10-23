@@ -36,13 +36,22 @@ class ClueState:
         self.me = start["you"]["seat"]
         self.my_char = start["you"]["character"]
         self.hand = list(start.get("hand") or [])
-        self.seats = list(start.get("turnOrder") or start.get("seats"))
         self.characters = dict(start.get("characters") or {})
+        self.seats = list(start.get("turnOrder") or start.get("seats") or self.characters)
+        if self.me not in self.seats:
+            self.seats.append(self.me)
         self.char_seat = {v: k for k, v in self.characters.items()}
-        self.hand_sizes = dict(start.get("handSizes") or {})
         self.suspects = list(start["suspects"])
         self.weapons = list(start["weapons"])
         self.rooms = list(start["rooms"])
+        self.hand_sizes = dict(start.get("handSizes") or {})
+        if any(s not in self.hand_sizes for s in self.seats):
+            # Not published: assume a round-robin deal starting with the first seat.
+            dealt = len(self.suspects) + len(self.weapons) + len(self.rooms) - 3
+            base, extra = divmod(dealt, len(self.seats))
+            for i, s in enumerate(self.seats):
+                self.hand_sizes.setdefault(s, base + (1 if i < extra else 0))
+            self.hand_sizes[self.me] = len(start.get("hand") or [])
         self.turn_limit = int(start.get("turnLimit") or 60)
         self.board = Board(start["board"])
         self.positions = {}
@@ -68,6 +77,8 @@ class ClueState:
                     self.pulled = False
             elif t == "suggestion-made":
                 sg = Suggestion(ev)
+                if "passedSeats" not in ev and sg.suggester in self.seats:
+                    sg.passed = self._seats_between(sg.suggester, sg.refuter)
                 self.suggestions.append(sg)
                 self.positions[sg.suspect] = ("room", sg.room)
                 if sg.suggester == self.me:
@@ -77,18 +88,22 @@ class ClueState:
             elif t == "card-shown":
                 card = ev.get("card")
                 for sg in reversed(self.suggestions):
-                    if sg.turn == ev.get("turn") and sg.refuter == ev.get("refuter"):
+                    same_turn = ev.get("turn") is None or sg.turn is None or sg.turn == ev.get("turn")
+                    same_refuter = ev.get("refuter") is None or sg.refuter == ev.get("refuter")
+                    if same_turn and same_refuter:
                         if card:
                             sg.card = card
+                        if card and sg.refuter == self.me:
+                            self.shown_by_me.setdefault(ev.get("shownTo") or sg.suggester, set()).add(card)
                         break
-                if card and ev.get("refuter") == self.me:
-                    self.shown_by_me.setdefault(ev.get("shownTo"), set()).add(card)
             elif t == "accusation-made":
-                acc = ev.get("accusation") or {}
-                if not ev.get("correct"):
+                acc = ev.get("accusation") or ev
+                names = [acc.get("suspect"), acc.get("weapon"), acc.get("room")]
+                failed = ev.get("correct") is False or (ev.get("correct") is None and ev.get("eliminated"))
+                if failed and all(isinstance(x, str) for x in names):
                     self.failed_accusations.append(
-                        ["suspect:" + acc.get("suspect"), "weapon:" + acc.get("weapon"), "room:" + acc.get("room")])
-                if ev.get("eliminated"):
+                        ["suspect:" + names[0], "weapon:" + names[1], "room:" + names[2]])
+                if ev.get("eliminated") or ev.get("correct") is False:
                     self.eliminated.add(ev.get("accuser"))
                 if ev.get("unblockedInto"):
                     ch = self.characters.get(ev.get("accuser"))
@@ -111,6 +126,17 @@ class ClueState:
                         self.positions[ch] = ("room", ev["unblockedInto"])
                 if ev.get("endsTurn"):
                     self._advance(ev)
+
+    def _seats_between(self, suggester, refuter):
+        """Seats asked before `refuter` (all others if nobody refuted)."""
+        i = self.seats.index(suggester)
+        out = []
+        for k in range(1, len(self.seats)):
+            s = self.seats[(i + k) % len(self.seats)]
+            if s == refuter:
+                break
+            out.append(s)
+        return out
 
     def _advance(self, ev):
         if ev.get("terminalReason"):

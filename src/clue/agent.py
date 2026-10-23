@@ -10,6 +10,7 @@ Pipeline per decision:
 """
 import math
 import random
+import time
 
 from common.io import log
 from common.timer import OutOfTime
@@ -66,6 +67,8 @@ class Analysis:
         self.idx = {s: i for i, s in enumerate(st.seats)}
         self.me = self.idx[st.me]
         n = self.kn.n
+        now = time.monotonic()
+        self.kn.deadline = now + max(0.05, budget.remaining() * 0.35)
         try:
             self.mat = self.kn.tighten()
         except Exception as e:
@@ -78,6 +81,9 @@ class Analysis:
                 self.cands[k].append(i)
         self.certain = all(len(c) == 1 for c in self.cands)
         self.samples = []
+        if time.monotonic() > self.kn.deadline:
+            log("clue tighten hit its deadline")
+        self.kn.deadline = time.monotonic() + max(0.05, budget.remaining() * 0.35)
         if not self.certain and not budget.expired():
             try:
                 self.samples = Sampler(self.kn, seed=random.randrange(1 << 30)).samples(n_samples=n_samples)
@@ -441,6 +447,13 @@ class Agent:
 
     # ------------------------------------------------------------------
     def fallback(self, msg):
+        try:
+            return self._fallback(msg)
+        except Exception as e:
+            log("clue fallback error", repr(e))
+            return last_resort(msg)
+
+    def _fallback(self, msg):
         st = ClueState(msg.get("history") or [])
         kind = (msg.get("decision") or {}).get("kind")
         if kind == "show-card":
@@ -472,3 +485,33 @@ class Agent:
             if path:
                 return {"type": "pawn-moved", "path": self._cells(path)}
         return {"type": "turn-ended"}
+
+
+def last_resort(msg):
+    """Reply straight from the raw events, without ClueState (mirrors the docs' example bot)."""
+    kind = (msg.get("decision") or {}).get("kind")
+    events = [it.get("event") or {} for it in msg.get("history") or []]
+    start = next((e for e in events if e.get("type") == "game-started"), {})
+    me = (start.get("you") or {}).get("seat")
+    hand = set(start.get("hand") or [])
+    if kind == "show-card":
+        sg = next((e for e in reversed(events)
+                   if e.get("type") == "suggestion-made" and e.get("refuter") == me), {})
+        s = sg.get("suggestion") or {}
+        cards = ["suspect:%s" % s.get("suspect"), "weapon:%s" % s.get("weapon"), "room:%s" % s.get("room")]
+        return {"type": "card-shown", "card": next((c for c in cards if c in hand), sorted(hand)[0])}
+    if kind == "make-suggestion":
+        char = (start.get("you") or {}).get("character")
+        room = None
+        for e in events:
+            if e.get("type") == "pawn-moved" and e.get("suspect") == char:
+                room = (e.get("to") or {}).get("room")
+            elif e.get("type") == "suggestion-made" and (e.get("suggestion") or {}).get("suspect") == char:
+                room = (e.get("suggestion") or {}).get("room")
+        sus = start.get("suspects") or []
+        weps = start.get("weapons") or []
+        return {"type": "suggestion-made",
+                "suspect": next((x for x in sus if "suspect:" + x not in hand), sus[0] if sus else None),
+                "weapon": next((x for x in weps if "weapon:" + x not in hand), weps[0] if weps else None),
+                "room": room}
+    return {"type": "turn-ended"}

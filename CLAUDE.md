@@ -8,10 +8,10 @@ One Python 3.13 ZIP plays three games: Connect Four (tutorial), Clue (medium wei
 - [ ] **Get the real Clue board.** This is the biggest open risk: all Clue movement testing so far used a board I made up (`tools/clue_board.py`).
   1. Run one practice Clue match.
   2. Copy the full `game-started` event from the replay or history and save it as `tools/fixtures/clue_game_started.json`. `clue_board.load()` and the simulator pick it up automatically.
-  3. From the replay, note: can a pawn re-enter the room it just left, and can it walk through or stop on a door square? Does the turn counter skip eliminated players?
+  3. From the replay, note: can a pawn re-enter the room it just left, and can it walk through or stop on a door square? Does the turn counter skip eliminated players? Also check that `game-started` has `turnOrder`, `handSizes` and `turnLimit`, and that `suggestion-made` has `passedSeats`. We now cope without them, but the real field names are better.
   4. Ask Claude to re-run `python -m unittest tests.test_all.ClueMovementTests tests.test_all.ClueDeductionTests` and `tools/sim_clue.py` on the real board, and to relax `src/clue/board.py` if the engine allows more.
 - [ ] **Upload `dist/submission.zip`** and play one practice match each of Connect Four and Secret Dictator. Paste any errors or odd replay behaviour into a Claude session. Each match counts against the $2/day practice cap.
-- [ ] **Rebuild the zip after any change:** run `python tools/build_zip.py`, which writes `dist/submission.zip` and checks the limits. The last build, on 2026-10-23, was verified from a clean extracted copy.
+- [ ] **Rebuild the zip after any change:** run `python tools/build_zip.py`, which writes `dist/submission.zip` and checks the limits. The last build, on 2026-10-23 and after the Clue solver rewrite, was verified from a clean extracted copy with `python -I` (24 files, 46 KB zipped).
 - [ ] **Optional, when the machine is idle:** resume the Connect Four book with `python tools/c4_book.py 10 2` (low CPU, resumable, Ctrl+C anytime). When it prints `wrote N entries`, rebuild the zip.
 - [ ] **Before the 2026-11-01 23:59 CST lock:** submit the final zip and choose it as your tournament agent.
 
@@ -33,8 +33,10 @@ crucible.json          runtime + entrypoint (src/main.py)
 src/main.py            stdin loop; each decision runs in a worker thread under a watchdog -> legal fallback on error/timeout
 src/common/            io (reply + log budget, CRUCIBLE_QUIET), timer (Budget), llm (stdlib relay client)
 src/connect4/          solver.py (Pons-style bitboard negamax), heuristic.py, agent.py (book -> exact solve -> heuristic), book.txt (generated)
-src/clue/              state.py (history -> state + constraints), deduce.py (exact CSP + MCMC deal sampler),
-                       board.py (BFS/paths/validation), agent.py (accuse / info-gain suggestions / movement / card showing)
+src/clue/              state.py (history -> state + constraints; tolerant of missing optional fields),
+                       deduce.py (exact CSP with clause branching + capacity matching + deadline; MCMC deal sampler),
+                       board.py (BFS/paths/validation), agent.py (accuse / info-gain suggestions / movement / card showing;
+                       fallback -> last_resort() which reads raw events only)
 src/sd/                state.py, belief.py (Bayes over 60 role hypotheses), claims.py (regex + LLM claim parsing),
                        policy.py (role policies, PARAMS tunable via SD_PARAMS), talk.py (templates + optional LLM phrasing), agent.py
 tools/                 sim_c4.py, sim_clue.py, sim_sd.py (local engines), tune_sd.py, c4_book.py, mock_relay.py,
@@ -59,15 +61,19 @@ tests/test_all.py      stdlib unittest
   - Opening-book generation is **paused and resumable**: stopped mid-round 12 on 2026-10-23, with solved leaves cached in `tools/c4_leaf_cache.json` (commit this file so progress isn't lost). `src/connect4/book.txt` is **not written yet**; it only appears when the proof completes.
   - Without the book, the agent searches live (exact solve from ~ply 10, heuristic before that).
 - **Clue:** self-play has zero faults and a correct solve every game (avg ~14 total turns with 4 players), with ~1 s per decision. It beats the example bot, which also faults on its own (stale roll after `detective-faulted`).
+  - 2026-10-23: the exact CSP (`deduce.feasible`) now branches on refutation clauses and does a capacity-matching check. Clause-heavy 6-player positions dropped from 7–17 s to about 0.02 s, with identical or more exact results (cross-checked against the old solver on 300 random positions). It also respects a deadline (`Knowledge.deadline`), set by `Analysis` to about 35% of the budget. Six-player self-play worst case is 0.9 s per decision.
+  - `ClueState` now copes with missing `turnOrder`/`seats`, `handSizes` (assumes a round-robin deal), `passedSeats` (derived from the turn order), `turn` on `card-shown`, and `correct` on accusations. `Agent.fallback` falls back to `last_resort()`, which reads raw events only.
+  - The docs' example bot leaves a room by stepping onto its own door with `enterRoom` set to that same room, so the real engine probably allows re-entering the room you just left. We still don't rely on that (see TODO 2).
 - **Secret Dictator:**
   - Zero faults, including with the mock relay at a 20% failure rate.
   - In self-play our fascist team now wins ~30% (it was 15.7% before vote tuning). See TODO 4 for the details.
   - Against the simple baseline: our fascists win 79% (baseline fascists 72%) and our liberals win 32% (baseline 26–30%).
-- **Tests:** 8 of 9 passed. The failing Connect Four test was a bad test position (a double threat); it has been fixed but not yet re-run.
+- **Tests:** all pass (10 tests, including the new `test_witnesses_valid_and_fast`). Local Python is 3.14; the sources parse with `feature_version=(3,13)` and use only the stdlib.
 
 ## TODO (in priority order)
 1. **Confirm the Python runtime id** for `crucible.json` on arenova-ctf.com. Then do one practice match per game. Save the replays or histories into `tools/fixtures/`, especially a real Clue `game-started` payload as `tools/fixtures/clue_game_started.json` (`clue_board.load()` picks it up automatically). Re-run the Clue sims and tests on the real board.
 2. Check the real engine's rules against our assumptions: can a pawn re-enter its own room, walk through door squares, or stand on a door square? Does the turn counter skip eliminated players? If the real rules are looser, relax `clue/board.py` and check our moves still validate.
+   - Evidence so far: the docs' example bot leaves a room by stepping onto its own door with `enterRoom` set to the same room. So re-entry is probably legal, and that would let us suggest from the same room every turn. Confirm from a replay before using it.
 3. **Finish the Connect Four book** (`python tools/c4_book.py 10 2`, low CPU, resumable). Then confirm `book.txt` is well under 4 MB and that the agent loads it (it logs "c4 book entries"). Consider a yellow-side book after that.
 4. ~~Secret Dictator tuning~~ **Done (2026-10-23).**
    - Round 2 in self-play (105 games each), fascist-team win rate:
@@ -85,9 +91,9 @@ tests/test_all.py      stdlib unittest
    - **Applied a compromise:** `f_vote_mate_yes=0.6`, `f_vote_libgov_yes=0.9`. The "yes for the Dictator as chancellor after 3F" rule still always applies.
    - Possible next step: vote yes for a teammate only when our vote is likely to be pivotal.
 5. ~~Clue A/B test~~ **Done (2026-10-23):** threat-aware won 14/40 four-player games against 3 non-aware copies (fair share 10); all games ended solved. Kept `threat_aware=True`. Optionally re-check with 3 and 5 players.
-6. ~~Re-run the fixed Connect Four test~~ **Done:** `ConnectFourTests` pass. Run the full suite once more before submitting (~6 min).
-7. `WRITEUP.md` **draft written.** Update its results section with final numbers before submitting.
-8. **Zip verified (2026-10-23):** 24 files, ~45 KB, within limits, without the Connect Four book. Extracted to a clean directory and run with `python -I`, it answers the docs' example Connect Four and Secret Dictator requests correctly. Rebuild with `python tools/build_zip.py` (writes `dist/submission.zip`) after any change, and again once `book.txt` exists. Upload it, and run one practice match per game with the real relay (watch the $2/day cap).
+6. ~~Re-run the fixed Connect Four test~~ **Done:** the full suite passes (10 tests, ~3.5 min, 2026-10-23). Run it once more before submitting.
+7. `WRITEUP.md` **draft written** and updated for the Clue solver rewrite (2026-10-23). Update its results section with final numbers, including practice matches, before submitting.
+8. **Zip verified (2026-10-23, after the Clue changes):** 24 files, 46 KB, within limits, without the Connect Four book. Extracted to a clean directory and run with `python -I`, it answers the docs' example Connect Four and Secret Dictator requests correctly. Rebuild with `python tools/build_zip.py` (writes `dist/submission.zip`) after any change, and again once `book.txt` exists. Upload it, and run one practice match per game with the real relay (watch the $2/day cap).
 9. Optional improvements:
    - Secret Dictator: smarter liberal discussion (call out vote patterns), and dictator play after 3 fascist policies.
    - Clue: account for which card a refuter chooses to show; plan suggestions that pull opponents' pawns.
